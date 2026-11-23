@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -10,11 +11,19 @@ from reel_seed import seed_reels
 
 router = APIRouter(prefix="/api/tapes")
 
+PASS_ACCURACY = 0.6
+
 class Measurement(BaseModel):
     start_second: int = Field(ge=0,le=86400)
     dropout: int = Field(ge=0,le=30)
     snaps: int = Field(ge=0,le=20)
     residue: int = Field(ge=0,le=9)
+
+class Correction(BaseModel):
+    dropout: int = Field(ge=0,le=30)
+    snaps: int = Field(ge=0,le=20)
+    residue: int = Field(ge=0,le=9)
+    known_route: Literal["clean","mend","rehouse"]
 
 class Assignment(BaseModel):
     excerpt: str = Field(min_length=1,max_length=50)
@@ -26,15 +35,23 @@ class Manifest(BaseModel):
 
 class Card(BaseModel):
     excerpt: str = Field(min_length=1,max_length=50)
-    evaluation: int = Field(gt=0)
 
 def rows_for(cx,evaluation):
+    """送审时快照的病征与签认工序，排队复验与开卡依据均以此为准。"""
     return cx.execute("""
-        SELECT signal_excerpts.*,acetate_reels.donation,holdout_assignments.fold
-        FROM holdout_assignments JOIN signal_excerpts ON signal_excerpts.code=excerpt
+        SELECT holdout_assignments.excerpt AS code,signal_excerpts.reel,acetate_reels.donation,
+               holdout_assignments.fold,holdout_assignments.dropout,holdout_assignments.snaps,
+               holdout_assignments.residue,holdout_assignments.known_route
+        FROM holdout_assignments JOIN signal_excerpts ON signal_excerpts.code=holdout_assignments.excerpt
         JOIN acetate_reels ON acetate_reels.code=signal_excerpts.reel
-        WHERE evaluation=%s ORDER BY signal_excerpts.code
+        WHERE holdout_assignments.evaluation=%s ORDER BY holdout_assignments.excerpt
     """,(evaluation,)).fetchall()
+
+def effective_manifest(cx):
+    return cx.execute("""
+        SELECT * FROM evaluation_manifests WHERE activated_at IS NOT NULL
+        ORDER BY id DESC LIMIT 1
+    """).fetchone()
 
 def validate(rows):
     by_donor = defaultdict(set)
@@ -57,9 +74,18 @@ def catalog(user=Depends(require())):
             SELECT signal_excerpts.*,acetate_reels.donation FROM signal_excerpts
             JOIN acetate_reels ON acetate_reels.code=reel ORDER BY reel,start_second
         """).fetchall()
-        manifests = cx.execute("SELECT * FROM evaluation_manifests ORDER BY id DESC LIMIT 30").fetchall()
-        cards = cx.execute("SELECT * FROM conservation_cards ORDER BY id DESC").fetchall()
-    return {"reels":reels,"readings":readings,"manifests":manifests,"cards":cards}
+        manifests = cx.execute("""
+            SELECT evaluation_manifests.*,app_jobs.status AS job_status,app_jobs.error AS job_error
+            FROM evaluation_manifests LEFT JOIN app_jobs ON app_jobs.id=evaluation_manifests.job
+            ORDER BY evaluation_manifests.id DESC LIMIT 30
+        """).fetchall()
+        cards = cx.execute("""
+            SELECT conservation_cards.*,evaluation_manifests.label AS evaluation_label
+            FROM conservation_cards JOIN evaluation_manifests ON evaluation_manifests.id=evaluation
+            ORDER BY conservation_cards.id DESC
+        """).fetchall()
+        effective = effective_manifest(cx)
+    return {"reels":reels,"readings":readings,"manifests":manifests,"cards":cards,"effective":effective}
 
 @router.post("/reels/{code}/excerpt",status_code=201)
 def log_excerpt(code: str, data: Measurement,user=Depends(require("operator"))):
@@ -75,6 +101,21 @@ def log_excerpt(code: str, data: Measurement,user=Depends(require("operator"))):
             (sample,code,data.start_second,data.dropout,data.snaps,data.residue),
         )
     return {"code":sample}
+
+@router.post("/excerpts/{code}/correct")
+def correct(code: str, data: Correction,user=Depends(require("reviewer"))):
+    """补正参考样段的病征与签认工序，仅影响之后封存的复验清单。"""
+    with db() as cx:
+        row = cx.execute("""
+            UPDATE signal_excerpts SET dropout=%s,snaps=%s,residue=%s,known_route=%s
+            FROM acetate_reels
+            WHERE signal_excerpts.reel=acetate_reels.code AND signal_excerpts.code=%s
+              AND acetate_reels.calibration
+            RETURNING signal_excerpts.*
+        """,(data.dropout,data.snaps,data.residue,data.known_route,code)).fetchone()
+        if not row:
+            raise HTTPException(409,"仅参考库样段可在工作台补正")
+    return row
 
 @router.post("/manifests",status_code=202)
 def submit_manifest(data: Manifest,user=Depends(require("reviewer"))):
@@ -92,11 +133,36 @@ def submit_manifest(data: Manifest,user=Depends(require("reviewer"))):
         assignment = {item.excerpt:item.fold for item in data.assignments}
         validate([row | {"fold":assignment[row["code"]]} for row in catalog_rows])
         version = cx.execute("INSERT INTO evaluation_manifests(label) VALUES (%s) RETURNING id",(data.label,)).fetchone()["id"]
+        snapshot = {row["code"]:row for row in catalog_rows}
         for item in data.assignments:
-            cx.execute("INSERT INTO holdout_assignments VALUES (%s,%s,%s)",(version,item.excerpt,item.fold))
+            row = snapshot[item.excerpt]
+            cx.execute(
+                "INSERT INTO holdout_assignments VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (version,item.excerpt,item.fold,row["dropout"],row["snaps"],row["residue"],row["known_route"]),
+            )
         job = enqueue(cx,"reel-validation",{"id":version})
         cx.execute("UPDATE evaluation_manifests SET job=%s WHERE id=%s",(job,version))
     return {"id":version,"job_id":job}
+
+@router.post("/manifests/{version}/retry",status_code=202)
+def retry_manifest(version: int,user=Depends(require("reviewer"))):
+    """复验失败后按同一版送审快照重试。"""
+    with db() as cx:
+        manifest = cx.execute(
+            "SELECT * FROM evaluation_manifests WHERE id=%s FOR UPDATE",(version,)
+        ).fetchone()
+        if not manifest:
+            raise HTTPException(404,"复验清单不存在")
+        if manifest["activated_at"]:
+            raise HTTPException(409,"该版已启用，无需重试")
+        if manifest["report"] is not None:
+            raise HTTPException(409,"该版已有复验报告，如需变更请补正样段后封存新版")
+        job = cx.execute("SELECT status FROM app_jobs WHERE id=%s",(manifest["job"],)).fetchone()
+        if job and job["status"] in ("queued","running"):
+            raise HTTPException(409,"该版复验正在排队或运行")
+        retry = enqueue(cx,"reel-validation",{"id":version})
+        cx.execute("UPDATE evaluation_manifests SET job=%s WHERE id=%s",(retry,version))
+    return {"id":version,"job_id":retry}
 
 def run_job(cx,kind,payload):
     if kind != "reel-validation":
@@ -106,6 +172,22 @@ def run_job(cx,kind,payload):
     validate(rows)
     report = compare(rows)
     cx.execute("UPDATE evaluation_manifests SET report=%s WHERE id=%s",(Jsonb(report),version))
+    if report["accuracy"][report["selected"]] >= PASS_ACCURACY:
+        activated = cx.execute("""
+            UPDATE evaluation_manifests SET activated_at=now()
+            WHERE id=%s AND activated_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM evaluation_manifests WHERE activated_at IS NOT NULL AND id>%s
+              )
+            RETURNING id
+        """,(version,version)).fetchone()
+        if activated:
+            cx.execute("""
+                UPDATE conservation_cards SET stage='returned',
+                    returned_reason='复验第 ' || %s::text || ' 版已启用，原依据第 '
+                        || evaluation::text || ' 版失效，请按生效版重算建议'
+                WHERE stage='proposed' AND evaluation<>%s
+            """,(version,version))
     return report
 
 @router.post("/cards",status_code=201)
@@ -115,27 +197,37 @@ def propose(data: Card,user=Depends(require("operator"))):
             SELECT signal_excerpts.* FROM signal_excerpts JOIN acetate_reels ON acetate_reels.code=reel
             WHERE signal_excerpts.code=%s AND NOT calibration
         """,(data.excerpt,)).fetchone()
-        model = cx.execute("SELECT * FROM evaluation_manifests WHERE id=%s",(data.evaluation,)).fetchone()
-        if not evidence or not model or not model["report"]:
-            raise HTTPException(409,"需待处理样段与已完成的分折复验")
-        route, explanation = METHODS[model["report"]["selected"]](evidence,rows_for(cx,data.evaluation))
-        if model["report"]["accuracy"][model["report"]["selected"]] < .6:
-            raise HTTPException(409,"分折均值低于 60%，转人工选择路线")
-        row = cx.execute("""
+        model = effective_manifest(cx)
+        if not evidence or not model:
+            raise HTTPException(409,"需待处理样段与已启用的分折复验")
+        route, explanation = METHODS[model["report"]["selected"]](evidence,rows_for(cx,model["id"]))
+        existing = cx.execute(
+            "SELECT * FROM conservation_cards WHERE excerpt=%s FOR UPDATE",(data.excerpt,)
+        ).fetchone()
+        if existing and existing["stage"] != "returned":
+            raise HTTPException(409,"该样段已有工序卡")
+        if existing:
+            return cx.execute("""
+                UPDATE conservation_cards SET evaluation=%s,route=%s,explanation=%s,
+                    stage='proposed',returned_reason=NULL,authoriser=NULL
+                WHERE id=%s RETURNING *
+            """,(model["id"],route,explanation,existing["id"])).fetchone()
+        return cx.execute("""
             INSERT INTO conservation_cards(excerpt,evaluation,route,explanation)
             VALUES (%s,%s,%s,%s) RETURNING *
-        """,(data.excerpt,data.evaluation,route,explanation)).fetchone()
-    return row
+        """,(data.excerpt,model["id"],route,explanation)).fetchone()
 
 @router.post("/cards/{card}/authorise")
 def authorise(card: int,user=Depends(require("reviewer"))):
     with db() as cx:
         row = cx.execute("""
             UPDATE conservation_cards SET stage='authorised',authoriser=%s
-            WHERE id=%s AND stage='proposed' RETURNING *
+            WHERE id=%s AND stage='proposed'
+              AND evaluation=(SELECT max(id) FROM evaluation_manifests WHERE activated_at IS NOT NULL)
+            RETURNING *
         """,(user["email"],card)).fetchone()
         if not row:
-            raise HTTPException(409,"仅待审工序卡可签发")
+            raise HTTPException(409,"仅依据当前生效版的待审工序卡可签发")
     return row
 
 def seed(cx):
@@ -147,8 +239,9 @@ def seed(cx):
     if record:
         version = record["id"]
         cx.execute("""
-            INSERT INTO holdout_assignments(evaluation,excerpt,fold)
-            SELECT %s,signal_excerpts.code,RIGHT(donation,1)::smallint
+            INSERT INTO holdout_assignments(evaluation,excerpt,fold,dropout,snaps,residue,known_route)
+            SELECT %s,signal_excerpts.code,RIGHT(donation,1)::smallint,
+                   signal_excerpts.dropout,signal_excerpts.snaps,signal_excerpts.residue,signal_excerpts.known_route
             FROM signal_excerpts JOIN acetate_reels ON acetate_reels.code=reel WHERE calibration
         """,(version,))
         run_job(cx,"reel-validation",{"id":version})
